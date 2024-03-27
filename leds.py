@@ -47,8 +47,7 @@ def print(*args, **kwargs):
     global logfile_unique
     global log_time_start
 
-    #if (time.time() - log_time_start) > 86400:
-    if (time.time() - log_time_start) > 30:
+    if (time.time() - log_time_start) > 86400:
         create_new_log()
         log_time_start = time.time()
 
