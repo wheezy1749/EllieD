@@ -12,38 +12,53 @@ import sys
 from rpi_rf import RFDevice
 from pathlib import Path
 from datetime import datetime
+import builtins
+import simpleaudio as sa
+import wave
+import atexit
 
-# MAC Addresses of clients so we do don't need to hardcode IP address and we can find them if network changes in the future
-LAMP_CLIENT_MAC = "E0:5A:1B:79:8D:88"
-MOTION_CLIENT_MAC = "08:B6:1F:81:D8:C4"
-LD2410_CLIENT_MAC = "08:B6:1F:81:6D:E0"
-global MOTION_CLIENT_IP 
-MOTION_CLIENT_IP = ""
-global LAMP_CLIENT_IP 
-LAMP_CLIENT_IP = ""
-global LD2410_CLIENT_IP
-LD2410_CLIENT_IP = ""
+global test_mode
+test_mode = False
 
-
-try:
-    import __builtin__
-except ImportError:
-    import builtins as __builtin__
-
+subprocess.call(["join.py", "--text", "'led.py restarted'"])
+play_lock = threading.Lock()
 dir_path = os.path.dirname(os.path.realpath(__file__))
 dir_sounds = os.path.join(dir_path, "sounds")
 log_path = os.path.join(dir_path, "logs")
+#remove old logs except last 10
+os.system("ls -1rt -d -1 /root/EllieD/logs/* | head -n -10 | xargs -d '\n' rm -f --")
 Path(log_path).mkdir(parents=True, exist_ok=True)
-logfile_unique = datetime.now().strftime("%Y.%m.%d.%H.%M.%S.log")
-logfile_unique = os.path.join(log_path, logfile_unique)
+log_time_start = time.time()
+
+def onClose():
+    subprocess.call(["join.py", "--text", "leds.py crashed"])
+    pass
+
+atexit.register(onClose)
+
+def create_new_log():
+    global logfile_unique
+    logfile_unique = datetime.now().strftime("%Y.%m.%d.%H.%M.%S.log")
+    logfile_unique = os.path.join(log_path, logfile_unique)
+
+create_new_log()
+
 def print(*args, **kwargs):
+    global logfile_unique
+    global log_time_start
+
+    #if (time.time() - log_time_start) > 86400:
+    if (time.time() - log_time_start) > 30:
+        create_new_log()
+        log_time_start = time.time()
+
     logf = open(logfile_unique, 'a')
     stamp = datetime.now().strftime("[%Y.%m.%d.%H.%M.%S] ")
     logf.write(stamp)
-    __builtin__.print(*args, **kwargs, file=logf)
+    builtins.print(*args, **kwargs, file=logf)
     logf.close()
     sys.stdout.write(stamp)
-    __builtin__.print(*args, **kwargs)
+    builtins.print(*args, **kwargs)
 
 def find_client_ip(mac):
     ip = ""
@@ -58,12 +73,16 @@ def find_client_ip(mac):
 
     return ip
 
+def load_wave(path):
+    with wave.open(path, 'rb') as wav_file:
+        audio_data = wav_file.readframes(wav_file.getnframes())
+    return audio_data
+
+
 led_lock = threading.Lock()
 lamp_lock = threading.Lock()
 lock_fade_request = threading.Lock()
-pwm_pin = 19
-global last_pwm_brightness_set
-last_pwm_brightness_set = 100
+pwm_pin = 12
 
 class bcolors:
     HEADER = '\033[95m'
@@ -97,7 +116,7 @@ class Timer(object):
 
             print(f"{color}[{self.name}][{duration:.3f} seconds][{bcolors.ENDC}]")
 
-class LEDS:
+class LightClients:
 
     delay_levels = [(30, "30s.mp3"),
                     (1*60, "1m.mp3"),
@@ -109,16 +128,20 @@ class LEDS:
                     (2*60*60,"2h.mp3"),
                     (6*6*60,"6h.mp3"),
                     (12*60*60,"12h.mp3")]
-    sound_up = "up.mp3"
-    sound_down = "down.mp3"
-    sound_motion_on = "motion_on.mp3"
-    sound_motion_off = "motion_off.mp3"
-    sound_bad_input = "bad_input.mp3"
-    sound_preset = "preset.mp3"
+    sound_up = os.path.join(dir_path,"sounds/up.wav")
+    sound_down = os.path.join(dir_path,"sounds/down.wav")
+    sound_bad_input = os.path.join(dir_path,"sounds/bad_input.wav")
     settings_path = os.path.join(dir_path,'settings.json')
+    LAMP_CLIENT_MAC = "E0:5A:1B:79:8D:88"
+    MOTION_CLIENT_MAC = "08:B6:1F:81:D8:C4"
+    LD2410_CLIENT_MAC = "08:B6:1F:81:6D:E0"
     pi = None
 
     def __init__(self):
+        self.PWM_CLIENT_IP = "192.168.50.60"
+        self.MOTION_CLIENT_IP = "192.168.50.54"
+        self.LAMP_CLIENT_IP = "192.168.50.220"
+        self.LD2410_CLIENT_IP = "192.168.50.221"
 
         if os.path.exists(self.settings_path):
             self.load_settings()
@@ -129,15 +152,17 @@ class LEDS:
             self._lamp_brightness = self._brightness
             self._delay = 0
             self._motion_enabled = True
-            self._volume = 1024*2
+            self._volume = 70
 
         self._power_state = True
         self._motion_timer = time.time() + 10 #add 10 seconds so no timeout will happen on reboots or power outages
         self.pi = pigpio.pi()
         self.pi.write(pwm_pin, 1)
         self.pi.set_PWM_frequency(pwm_pin, 732)
-        self.remote_delay = 0.1
+        self.remote_delay = 0.25
         self.last_remote_time = 0
+        self.last_pwm_brightness_set = self._brightness
+        self.off_because_of_motion = False
 
         if self._power_state:
             self._setPWMBrightness(self._brightness)
@@ -145,17 +170,29 @@ class LEDS:
 
 
     def increase_volume(self):
-        print("volume = " + str(self._volume))
-        if self._volume >= 32768:
+        volume = self._volume
+        volume += 5
+        if volume < 60:
+            volume = 60
+
+        if volume > 100:
             return False
-        self._volume += 1024
+
+        subprocess.run(["amixer", "sset","'Speaker'", str(volume) + '%'])
+        self._volume = volume
+        print("volume = " + str(self._volume))
         return True
 
     def decrease_volume(self):
-        print("volume = " + str(self._volume))
-        if self._volume <= 0:
+        volume = self._volume
+        volume -= 5
+        if volume < 60:
+            subprocess.run(["amixer", "sset","'Speaker'", '0%'])
             return False
-        self._volume -= 1024
+
+        subprocess.run(["amixer", "sset","'Speaker'", str(volume) + '%'])
+        self._volume = volume
+        print("volume = " + str(self._volume))
         return True
 
     def handle_remote_event(self, event):
@@ -179,8 +216,8 @@ class LEDS:
                 if led_lock.locked() or lamp_lock.locked():
                     return None
                 self._power_state = True
-                self.fade_leds(2, self._brightness, on_off_event=True)
-                self.fade_lamp(2, self._brightness, on_off_event=True)
+                self.fade_leds(1, self._brightness, on_off_event=True)
+                self.fade_lamp(1, self._lamp_brightness, on_off_event=True)
 
         elif event == "STOP_BUTTON":
             if self._motion_enabled:
@@ -189,21 +226,24 @@ class LEDS:
                 self.enable_motion()
 
         elif event == "BRIGHTNESS_UP":
-            if self._brightness <= 95:
-                if not self.fade_leds(0, self._brightness + 5):
-                    return None
+            if self._brightness == 1:
+                level = 5
+            elif self._brightness <= 95:
+                level = self._brightness + 5
             else:
-                event = "BAD_INPUT"
+                level = 100
+
+            if not self.fade_leds(0, level):
+                return None
 
         elif event == "BRIGHTNESS_DOWN":
-            if leds._brightness >= 5:
-                if self._brightness == 5:
-                    self.brightness = 6
+            if self._brightness > 5:
+                level = self._brightness - 5
+            elif self._brightness <= 5:
+                level = 1
 
-                if not self.fade_leds(0, self._brightness - 5):
-                    return None
-            else:
-                event = "BAD_INPUT"
+            if not self.fade_leds(0, level):
+                return None
 
         elif event == "BRIGHTNESS_MIN":
             if not self.fade_leds(1, 1):
@@ -211,9 +251,9 @@ class LEDS:
             if not self.fade_lamp(1, 5):
                 return None
         elif event == "BRIGHTNESS_75":
-            if not self.fade_leds(1, 75):
+            if not self.fade_leds(1, 60):
                 return None
-            if not self.fade_lamp(1, 75):
+            if not self.fade_lamp(1, 60):
                 return None
         elif event == "DELAY_30S":
             self.delay = 0
@@ -224,10 +264,9 @@ class LEDS:
         elif event  == "LAMP_UP":
             if lamp_lock.locked():
                 return None
-            if self._brightness <= 90:
-                self.fade_lamp(0, self._lamp_brightness + 5)
-            else:
-                event = "BAD_INPUT"
+            if self._lamp_brightness <= 80:
+                if not self.fade_lamp(0, self._lamp_brightness + 5):
+                    return None
         elif event  == "LAMP_DOWN":
             if lamp_lock.locked():
                 return None
@@ -247,6 +286,7 @@ class LEDS:
         time.sleep(0.05)
 
     def handle_motion_event(self, event):
+
         if not self._motion_enabled:
             if event == "MOTION_DETECTED":
                 self._motion_timer = time.time()
@@ -257,7 +297,8 @@ class LEDS:
             self._motion_timer = time.time()
             if not self._power_state:
                 print("Motion detected when lights are off!")
-                print("Turning lights on quickly!")
+                print(f"Turning lights on quickly! LED level = {self._brightness}, Lamp level = {self._lamp_brightness}")
+                self.off_because_of_motion = False
                 self.fade_leds(1, self._brightness, on_off_event=True)
                 self.fade_lamp(1, self._lamp_brightness, on_off_event=True)
                 self._power_state = True
@@ -269,8 +310,9 @@ class LEDS:
 
         if motionless_time > interval:
             if self._power_state:
-                print("Motion not detected for {interval} seconds")
+                print(f"Motion not detected for {interval} seconds")
                 print("TURNING LIGHT to 1% AUTOMATICALLY OVER 3 Seconds")
+                self.off_because_of_motion = True
                 self.fade_leds(3,1, on_off_event=True)
                 self.fade_lamp(3,1, on_off_event=True)
                 self._power_state = False
@@ -301,7 +343,7 @@ class LEDS:
                             "DELAY_10M"
                          )
 
-        motion_events = ("MOTION_DETECTED", "MOTIONLESS", "ACK")
+        motion_events = ("MOTION_DETECTED", "MOTIONLESS")
 
         if event in remote_events:
             print(f"Got remote event: {event}")
@@ -310,7 +352,7 @@ class LEDS:
             print(f"Got motion event: {event}")
             self.handle_motion_event(event)
         else:
-            if not self.parse_ld2410_info(event):
+            if not self.parse_ld2410_info(event) and event != "ACK":
                 print(f"Got unknown event {event}")
 
     def parse_ld2410_info(self, event):
@@ -322,6 +364,8 @@ class LEDS:
         if "Stationary" in event or "Moving" in event:
             print(event)
             return True
+        if "Detected" in event:
+            return
 
         return False
 
@@ -337,10 +381,14 @@ class LEDS:
         print(f"Brightness set to {level}")
 
     def _setPWMBrightness(self, brightness):
-        global last_pwm_brightness_set
         level = 255 - int(brightness * 2.55)
-        self.pi.set_PWM_dutycycle(pwm_pin, level)
-        last_pwm_brightness_set = brightness
+        if level == 253:
+            level = 254
+
+        cmd = f"^SET_PWM {level}$"
+        print(cmd)
+        sock.sendto(cmd.encode(), (self.PWM_CLIENT_IP, UDP_PORT));
+        self.last_pwm_brightness_set = brightness
 
     def _fade_lamp_thread(self, ftime):
         with lamp_lock:
@@ -357,7 +405,7 @@ class LEDS:
             print("Waiting for last event to end for critical on_off_event request to lamp")
             time.sleep(0.05)
 
-        send_to_lamp(int(ftime), int(value))
+        self.send_to_lamp(int(ftime), int(value))
         print(f"Sent fade request to lamp. Duty = {value}, time = {ftime}")
         if not on_off_event:
             self._lamp_brightness = int(value)
@@ -365,8 +413,7 @@ class LEDS:
         return True
 
     def _fade_leds_thread(self, ftime, value, on_off_event=False):
-        global last_pwm_brightness_set
-        start_value = last_pwm_brightness_set
+        start_value = self.last_pwm_brightness_set
 
         with led_lock:
             if start_value > value:
@@ -387,7 +434,6 @@ class LEDS:
 
 
     def fade_leds(self, ftime, value, on_off_event=False):
-        global last_pwm_brightness_set
         if led_lock.locked() and on_off_event:
             with lock_fade_request:
                 while led_lock.locked():
@@ -429,8 +475,9 @@ class LEDS:
             exec(f"{key} = {value}")
             print(f"Loaded {key} = {value}")
 
-    def play_thread(self, sound_path):
-        os.system(f"mpg123 -f {self._volume} {sound_path} 2>&1 /dev/null")
+    def play_thread(self, sound):
+        with play_lock:
+            subprocess.run(['aplay', sound])
 
     def alert(self, event):
         sound = self.sound_bad_input
@@ -440,12 +487,15 @@ class LEDS:
             return
 
         elif event == "POWER_BUTTON":
-            sound = self.sound_preset
+            if self._power_state:
+                sound = self.sound_up
+            else:
+                sound = self.sound_down
         elif event == "STOP_BUTTON":
             if self._motion_enabled:
-                sound = self.sound_motion_on
+                sound = self.sound_up
             else:
-                sound = self.sound_motion_off
+                sound = self.sound_down
         elif event in ("VOLUME_UP", "BRIGHTNESS_UP"):
             sound = self.sound_up
         elif event in ("VOLUME_DOWN", "BRIGHTNESS_DOWN"):
@@ -459,12 +509,10 @@ class LEDS:
                 sound = self.sound_down
             elif self._brightness < 75:
                 sound = self.sound_up
-        elif event == "BRIGHTNESS_50":
-            if (self._brightness == 50):
+        elif event == "BRIGHTNESS_MIN":
+            if (self._brightness == 1):
                 sound = self.sound_bad_input
-            elif self._brightness > 50:
-                sound = self.sound_down
-            elif self._brightness < 50:
+            else:
                 sound = self.sound_up
         elif event == "BRIGHTNESS_100":
             if self._brightness == 100:
@@ -473,8 +521,21 @@ class LEDS:
                 sound = self.sound_down
             elif self._brightness < 100:
                 sound = self.sound_up
-        sound_path = os.path.join(dir_sounds, sound)
-        threading.Thread(target=self.play_thread, args=(sound_path,), daemon=True).start()
+        elif "LAMP_UP" == event:
+            if self._lamp_brightness > 75:
+                sound = self.sound_bad_input
+            else:
+                sound = self.sound_up
+        elif "LAMP_DOWN" == event:
+            if self._lamp_brightness < 5:
+                sound = self.sound_bad_input
+            else:
+                sound = self.sound_down
+
+        if play_lock.locked():
+            return
+
+        threading.Thread(target=self.play_thread, args=(sound,), daemon=True).start()
 
 
     def save_settings(self):
@@ -491,13 +552,74 @@ class LEDS:
                 json.dump(s, f)
             print(json.dumps(s, indent=4))
 
+    def get_data(self, sock):
+        try:
+            data, addr = sock.recvfrom(32)
+            client_name = addr
+            event = data.decode('ascii').strip()
+            sock.sendto("ACK".encode(), addr);
+
+            global test_mode
+            if event == "TEST_MODE 0":
+                test_mode = False
+
+            if event == "TEST_MODE 1":
+                test_mode = True
+
+            addr=addr[0]
+            if test_mode and addr != "192.168.50.39":
+                return None
 
 
+            if addr == self.MOTION_CLIENT_IP:
+                addr = "MOTION CLIENT"
+            elif addr == self.LAMP_CLIENT_IP:
+                addr = "LAMP CLIENT"
+            elif addr == self.LD2410_CLIENT_IP:
+                addr = "LD2410_CLIENT"
+
+            if "MOTION" in event:
+                print(f"Got event : {bcolors.WARNING}{event}{bcolors.ENDC}".ljust(25) + f" from: {bcolors.WARNING}{addr}{bcolors.ENDC}")
+
+            if event == "MOTION_DETECTED" and self._motion_enabled and self.off_because_of_motion and addr == "LD2410_CLIENT":
+                print(f"We got motion from LD2410 but are in a timeout state. Only trust the PIR to turn lights on")
+                return None
+
+            return event
+        except BlockingIOError:
+            return None
+
+    def send_to_lamp(self, ftime, level):
+        ftime = int(ftime)
+        level = int(level)
+
+        cmd = f"LAMPSET {ftime} {level}"
+
+        try:
+            sock.sendto(cmd.encode(), (self.LAMP_CLIENT_IP, UDP_PORT));
+        except BlockingIOError:
+            return None
+
+    def determine_client_addresses(self):
+        print("Finding Client IPs...")
+        if self.LAMP_CLIENT_IP == "":
+            print("Finding LAMP")
+            self.LAMP_CLIENT_IP = find_client_ip(self.LAMP_CLIENT_MAC)
+        if self.MOTION_CLIENT_IP == "":
+            print("Finding PIR Sensor")
+            self.MOTION_CLIENT_IP = find_client_ip(self.MOTION_CLIENT_MAC)
+        if self.LD2410_CLIENT_IP == "":
+            print("Finding LD2410 Sensor")
+            self.LD2410_CLIENT_IP = find_client_ip(self.LD2410_CLIENT_MAC)
+
+        print("Found client Ips")
+        print(f"LAMP_CLIENT[{self.LAMP_CLIENT_MAC}] : {self.LAMP_CLIENT_IP}")
+        print(f"MOTION_CLIENT[{self.MOTION_CLIENT_MAC}] : {self.MOTION_CLIENT_IP}")
+        print(f"LD2410_CLIENT[{self.LD2410_CLIENT_MAC}] : {self.LD2410_CLIENT_IP}")
 
 
 class RF:
     def __init__(self):
-        signal.signal(signal.SIGINT, self.exithandler)
         self.rfdevice = None
         rf_pin = 27
         self.rfdevice = RFDevice(rf_pin)
@@ -505,10 +627,6 @@ class RF:
         self._timestamp = None
         self._code = None
         self.cmd = None
-
-    def exithandler(self, signal, frame):
-        self.rfdevice.cleanup()
-        sys.exit(0)
 
     def get_rf_cmd(self):
         time.sleep(0.01)
@@ -570,37 +688,6 @@ class RF:
 
         return cmd
 
-def get_data(sock):
-    try:
-        data, addr = sock.recvfrom(32)
-        client_name = addr
-        event = data.decode('ascii')
-
-        if addr == MOTION_CLIENT_IP:
-            client_name = "MOTION CLIENT"
-            print(f"Got event from PIR: {event}")
-        elif addr == LAMP_CLIENT_IP:
-            client_name = "LAMP CLIENT"
-
-        sock.sendto("ACK".encode(), addr);
-        return event
-    except BlockingIOError:
-        return None
-
-def send_to_lamp(ftime, level):
-    global lamp_status
-    ftime = int(ftime)
-    level = int(level)
-
-    cmd = f"LAMPSET {ftime} {level}"
-
-    if not lamp_status:
-        print(bcolors.FAIL + "LAMP OFFLINE! NOT SENDING LAMP COMMAND" + bcolors.ENDC)
-        return
-    try:
-        sock.sendto(cmd.encode(), (LAMP_CLIENT_IP, UDP_PORT));
-    except BlockingIOError:
-        return None
 
 
 def ping(host):
@@ -630,88 +717,30 @@ def every_10():
         return False
 
 
-# Setup ping on clients
-ping_lock = threading.Lock()
-global motion_status
-global lamp_status
-motion_status = 0
-lamp_status = 0
-
-def ping_thread():
-    global MOTION_CLIENT_IP
-    global LAMP_CLIENT_IP
-    global motion_status
-    global lamp_status
-    global LD2410_CLIENT_IP
-    while True:
-        if LAMP_CLIENT_IP == "":
-            LAMP_CLIENT_IP = find_client_ip(LAMP_CLIENT_MAC)
-        if MOTION_CLIENT_IP == "":
-            MOTION_CLIENT_IP = find_client_ip(MOTION_CLIENT_MAC)
-        if LD2410_CLIENT_IP == "":
-            LD2410_CLIENT_IP = find_client_ip(LD2410_CLIENT_MAC)
-
-        ms = ping(MOTION_CLIENT_IP)
-        print(f"motion client = {motion_status}")
-        ls = ping(LAMP_CLIENT_IP)
-        print(f"lamp  client = {lamp_status}")
-
-
-        with ping_lock:
-            motion_status = ms
-            lamp_status = ls
-
-        time.sleep(10)
-
 
 # Setup Server
 MY_IP = "192.168.50.39"
-MOTION_CLIENT_IP = find_client_ip(MOTION_CLIENT_MAC)
-LAMP_CLIENT_IP = find_client_ip(LAMP_CLIENT_MAC)
 UDP_PORT = 2390
-
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((MY_IP, UDP_PORT))
 sock.setblocking(False)
-
-
-global user_cmd
-user_cmd = None
-motion_status = ping(MOTION_CLIENT_IP)
-print(f"motion client = {motion_status}")
-lamp_status = ping(LAMP_CLIENT_IP)
-print(f"lamp IP = {LAMP_CLIENT_IP}")
-print(f"lamp client = {lamp_status}")
-print("Starting client ping thread")
-threading.Thread(target=ping_thread).start()
 
 # Start RF ISR
 print("Starting RF Library")
 rf = RF()
 
-# Start LED Class
-print("Starting LED Library")
-leds = LEDS()
+# Start Light Client Class
+print("Starting Light Client Library")
+lights = LightClients()
 
 print("Starting Loop")
 while True:
-
     with Timer("Main Loop", 0.05):
+
+        # Parse User Events
         user_cmd = rf.get_rf_cmd()
+        lights.handle_event(user_cmd)
 
-        leds.handle_event(user_cmd)
-
-        with ping_lock:
-            local_lamp_status = lamp_status
-            motion_clients_available = motion_status
-
-        if motion_clients_available:
-            motion_data = get_data(sock);
-            leds.handle_event(motion_data)
-
-
-
-
-
-
-
+        # Parse client events
+        motion_data = lights.get_data(sock);
+        lights.handle_event(motion_data)
