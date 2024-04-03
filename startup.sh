@@ -1,7 +1,3 @@
-sudo pigpiod
-
-stty -F /dev/ttyACM0 115200
-
 while [ 1 ]
 do
     sleep 10

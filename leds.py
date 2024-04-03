@@ -1,7 +1,6 @@
 #!/usr/bin/python3
 import socket
 import time
-import pigpio
 import subprocess
 import threading
 import json
@@ -20,7 +19,7 @@ import atexit
 global test_mode
 test_mode = False
 
-subprocess.call(["join.py", "--text", "'led.py restarted'"])
+subprocess.call(["/usr/local/bin/join.py", "--text", "'led.py restarted'"])
 play_lock = threading.Lock()
 dir_path = os.path.dirname(os.path.realpath(__file__))
 dir_sounds = os.path.join(dir_path, "sounds")
@@ -31,7 +30,7 @@ Path(log_path).mkdir(parents=True, exist_ok=True)
 log_time_start = time.time()
 
 def onClose():
-    subprocess.call(["join.py", "--text", "leds.py crashed"])
+    subprocess.call(["/usr/local/bin/join.py", "--text", "leds.py crashed"])
     pass
 
 atexit.register(onClose)
@@ -155,9 +154,6 @@ class LightClients:
 
         self._power_state = True
         self._motion_timer = time.time() + 10 #add 10 seconds so no timeout will happen on reboots or power outages
-        self.pi = pigpio.pi()
-        self.pi.write(pwm_pin, 1)
-        self.pi.set_PWM_frequency(pwm_pin, 732)
         self.remote_delay = 0.25
         self.last_remote_time = 0
         self.last_pwm_brightness_set = self._brightness
@@ -380,9 +376,13 @@ class LightClients:
         print(f"Brightness set to {level}")
 
     def _setPWMBrightness(self, brightness):
-        level = 255 - int(brightness * 2.55)
-        if level == 253:
-            level = 254
+        level = int(brightness * 2.55)
+        if brightness == 100:
+            level = 255
+        if brightness == 0:
+            level = 0
+        if brightness == 1:
+            level = 2
 
         cmd = f"^SET_PWM {level}$"
         print(cmd)
