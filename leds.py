@@ -29,6 +29,9 @@ os.system("ls -1rt -d -1 /root/EllieD/logs/* | head -n -10 | xargs -d '\n' rm -f
 Path(log_path).mkdir(parents=True, exist_ok=True)
 log_time_start = time.time()
 
+def round5(x):
+    return 5 * round(x/5)
+
 def onClose():
     subprocess.call(["/usr/local/bin/join.py", "--text", "leds.py crashed"])
     pass
@@ -124,6 +127,7 @@ class LightClients:
                     (30*60,"30m.mp3"),
                     (1*60*60,"1h.mp3"),
                     (2*60*60,"2h.mp3"),
+                    (3*60*60,"3h.mp3"),
                     (6*6*60,"6h.mp3"),
                     (12*60*60,"12h.mp3")]
     sound_up = os.path.join(dir_path,"sounds/up.wav")
@@ -136,6 +140,7 @@ class LightClients:
     pi = None
 
     def __init__(self):
+        self.IR_CLIENT_IP = "192.168.50.140"
         self.PWM_CLIENT_IP = "192.168.50.60"
         self.MOTION_CLIENT_IP = "192.168.50.54"
         self.LAMP_CLIENT_IP = "192.168.50.220"
@@ -221,21 +226,16 @@ class LightClients:
                 self.enable_motion()
 
         elif event == "BRIGHTNESS_UP":
-            if self._brightness == 1:
-                level = 5
-            elif self._brightness <= 95:
-                level = self._brightness + 5
-            else:
-                level = 100
+            if not self._power_state:
+                self._power_state = True
+
+            level = min(100, round5(self._brightness + 10))
 
             if not self.fade_leds(0, level):
                 return None
 
         elif event == "BRIGHTNESS_DOWN":
-            if self._brightness > 5:
-                level = self._brightness - 5
-            elif self._brightness <= 5:
-                level = 1
+            level = max(0, self._brightness - 10)
 
             if not self.fade_leds(0, level):
                 return None
@@ -251,22 +251,27 @@ class LightClients:
             if not self.fade_lamp(1, 60):
                 return None
         elif event == "DELAY_30S":
-            self.delay = 0
+            self._delay = 0
         elif event  == "DELAY_10M":
-            self.delay = 4
+            self._delay = 4
         elif event  == "DELAY_1H":
-            self.delay = 6
+            self._delay = 6
+        elif event  == "DELAY_3H":
+            self._delay = 8
         elif event  == "LAMP_UP":
+            if not self._power_state:
+                self._power_state = True
+
             if lamp_lock.locked():
                 return None
             if self._lamp_brightness <= 80:
-                if not self.fade_lamp(0, self._lamp_brightness + 5):
+                if not self.fade_lamp(0, self._lamp_brightness + 10):
                     return None
         elif event  == "LAMP_DOWN":
             if lamp_lock.locked():
                 return None
-            if self._lamp_brightness >= 5:
-                self.fade_lamp(0, self._lamp_brightness - 5)
+            if self._lamp_brightness >= 10:
+                self.fade_lamp(0, self._lamp_brightness - 10)
             else:
                 event = "BAD_INPUT"
         elif event == "VOLUME_UP":
@@ -275,6 +280,9 @@ class LightClients:
         elif event == "VOLUME_DOWN":
             if not self.decrease_volume():
                 event = "BAD_INPUT"
+
+        elif event[:3] == "IR_":
+            sock.sendto(event.encode(), (self.IR_CLIENT_IP, UDP_PORT));
 
         self.alert(event)
         self.save_settings()
@@ -318,10 +326,6 @@ class LightClients:
 
         event = event.strip()
 
-        if "MotionBLE" in event:
-            print(event)
-            return
-
         remote_events = (
                             "POWER_BUTTON",
                             "STOP_BUTTON",
@@ -335,7 +339,15 @@ class LightClients:
                             "DELAY_30S",
                             "VOLUME_DOWN",
                             "DELAY_1H",
-                            "DELAY_10M"
+                            "DELAY_3H",
+                            "DELAY_10M",
+                            "IR_FAN_STOP",
+                            "IR_LIGHT_ON",
+                            "IR_LIGHT_OFF",
+                            "IR_FAN_LOW",
+                            "IR_FAN_MID",
+                            "IR_FAN_HIGH",
+                            "MUSIC_BUTTON",
                          )
 
         motion_events = ("MOTION_DETECTED", "MOTIONLESS")
@@ -530,6 +542,12 @@ class LightClients:
                 sound = self.sound_bad_input
             else:
                 sound = self.sound_down
+        elif event == "IR_FAN_STOP":
+            sound = self.sound_down
+        elif event == "IR_LIGHT_OFF":
+            sound = self.sound_down
+        elif event[:3] == "IR_":
+            sound = self.sound_up
 
         if play_lock.locked():
             return
