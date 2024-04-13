@@ -15,6 +15,7 @@ import builtins
 import simpleaudio as sa
 import wave
 import atexit
+from client_ips import *
 
 global test_mode
 test_mode = False
@@ -140,22 +141,26 @@ class LightClients:
     pi = None
 
     def __init__(self):
+        """
+        self.SWITCH_CLIENT_IP = "192.168.50.140"
         self.IR_CLIENT_IP = "192.168.50.140"
         self.PWM_CLIENT_IP = "192.168.50.60"
         self.MOTION_CLIENT_IP = "192.168.50.54"
         self.LAMP_CLIENT_IP = "192.168.50.220"
         self.LD2410_CLIENT_IP = "192.168.50.221"
+        """
+        self.load_ips()
+        #defaults
+        self._light_switch = "IR_LIGHT_OFF"
+        self._fan_switch = "IR_FAN_STOP"
+        self._brightness = 20
+        self._lamp_brightness = self._brightness
+        self._delay = 0
+        self._motion_enabled = True
+        self._volume = 70
 
         if os.path.exists(self.settings_path):
             self.load_settings()
-        else:
-            #defaults
-            print("No saved settings. Loading default values")
-            self._brightness = 20
-            self._lamp_brightness = self._brightness
-            self._delay = 0
-            self._motion_enabled = True
-            self._volume = 70
 
         self._power_state = True
         self._motion_timer = time.time() + 10 #add 10 seconds so no timeout will happen on reboots or power outages
@@ -167,6 +172,9 @@ class LightClients:
         if self._power_state:
             self._setPWMBrightness(self._brightness)
             self.fade_lamp(1,self._lamp_brightness)
+
+        sock.sendto(self._light_switch.encode(), (self.IR_CLIENT_IP, UDP_PORT));
+        sock.sendto(self._fan_switch.encode(), (self.IR_CLIENT_IP, UDP_PORT));
 
 
     def increase_volume(self):
@@ -218,6 +226,25 @@ class LightClients:
                 self._power_state = True
                 self.fade_leds(1, self._brightness, on_off_event=True)
                 self.fade_lamp(1, self._lamp_brightness, on_off_event=True)
+        elif event == "LIGHT_SWITCH":
+            if self._light_switch == "IR_LIGHT_ON":
+               self._light_switch = "IR_LIGHT_OFF"
+            else:
+                self._light_switch = "IR_LIGHT_ON"
+
+            sock.sendto(self._light_switch.encode(), (self.IR_CLIENT_IP, UDP_PORT));
+
+        elif event == "FAN_SWITCH":
+            if self._fan_switch == "IR_FAN_LOW":
+                self._fan_switch = "IR_FAN_MID"
+            elif self._fan_switch == "IR_FAN_MID":
+                self._fan_switch = "IR_FAN_HIGH"
+            elif self._fan_switch == "IR_FAN_HIGH":
+                self._fan_switch = "IR_FAN_STOP"
+            elif self._fan_switch == "IR_FAN_STOP":
+                self._fan_switch = "IR_FAN_LOW"
+
+            sock.sendto(self._fan_switch.encode(), (self.IR_CLIENT_IP, UDP_PORT));
 
         elif event == "STOP_BUTTON":
             if self._motion_enabled:
@@ -270,7 +297,7 @@ class LightClients:
         elif event  == "LAMP_DOWN":
             if lamp_lock.locked():
                 return None
-            if self._lamp_brightness >= 10:
+            if self._lamp_brightness >= 0:
                 self.fade_lamp(0, self._lamp_brightness - 10)
             else:
                 event = "BAD_INPUT"
@@ -348,6 +375,8 @@ class LightClients:
                             "IR_FAN_MID",
                             "IR_FAN_HIGH",
                             "MUSIC_BUTTON",
+                            "LIGHT_SWITCH",
+                            "FAN_SWITCH",
                          )
 
         motion_events = ("MOTION_DETECTED", "MOTIONLESS")
@@ -475,6 +504,13 @@ class LightClients:
     def disable_motion(self):
         self._motion_enabled = False
 
+    def load_ips(self):
+        for name, ip in CLIENT_IPS.items():
+            if type(ip) == type(""):
+                exec(f'self.{name} = "{ip}"')
+            else:
+                exec(f'self.{name} = {ip}')
+
     def load_settings(self):
         print("Loading saved settings")
         if os.path.exists(self.settings_path):
@@ -483,8 +519,12 @@ class LightClients:
 
 
         for key, value in saved_settings.items():
-            exec(f"{key} = {value}")
-            print(f"Loaded {key} = {value}")
+            if type(value) == type(""):
+                exec(f'{key} = "{value}"')
+            else:
+                exec(f'{key} = {value}')
+
+            print(f'Loaded {key} = {value}')
 
     def play_thread(self, sound):
         with play_lock:
@@ -538,7 +578,7 @@ class LightClients:
             else:
                 sound = self.sound_up
         elif "LAMP_DOWN" == event:
-            if self._lamp_brightness < 5:
+            if self._lamp_brightness <= 0:
                 sound = self.sound_bad_input
             else:
                 sound = self.sound_down
@@ -564,6 +604,9 @@ class LightClients:
             s['self._delay'] = self._delay
             s['self._motion_enabled'] = self._motion_enabled
             s['self._volume'] = self._volume
+            s['self._light_switch'] = self._light_switch
+            s['self._fan_switch'] = self._fan_switch
+
 
             with open(self.settings_path, 'w') as f:
                 json.dump(s, f)
@@ -594,6 +637,10 @@ class LightClients:
                 addr = "LAMP CLIENT"
             elif addr == self.LD2410_CLIENT_IP:
                 addr = "LD2410_CLIENT"
+            elif addr == self.IR_CLIENT_IP:
+                addr = "IR_CLIENT"
+            elif addr == self.SWITCH_CLIENT_IP:
+                addr = "SWITCH_CLIENT"
 
             if "MOTION" in event:
                 print(f"Got event : {bcolors.WARNING}{event}{bcolors.ENDC}".ljust(25) + f" from: {bcolors.WARNING}{addr}{bcolors.ENDC}")
@@ -750,8 +797,14 @@ rf = RF()
 print("Starting Light Client Library")
 lights = LightClients()
 
+alive_time = time.time()
+
 print("Starting Loop")
 while True:
+    if time.time() - alive_time > 60:
+        print("led.py alive")
+        alive_time = time.time()
+
     with Timer("Main Loop", 0.05):
 
         # Parse User Events
